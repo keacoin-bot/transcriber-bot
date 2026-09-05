@@ -1,0 +1,5 @@
+aiogram==3.7.0
+yt-dlp==2026.8.19
+assemblyai==1.1.0
+gspread==6.2.1
+google-auth==2.57.0
