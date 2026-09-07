@@ -1,23 +1,32 @@
 """
-Одноразовый скрипт для получения refresh-токена Google (Device Flow).
+Одноразовый скрипт для получения refresh-токена Google (Authorization Code Flow).
+
+Device Flow (код+ссылка) не поддерживает доступ к Google Docs/Drive —
+Google ограничивает его простыми сервисами. Поэтому используем обычный
+способ авторизации, с ручным копированием кода из адресной строки браузера.
 
 Терминал bothost показывает вывод только ПОСЛЕ завершения команды —
-поэтому скрипт разбит на ДВА коротких запуска вместо одного долгого:
+поэтому скрипт разбит на ДВА коротких запуска:
 
 Шаг 1:
     python3 oauth_setup.py start
-    -> покажет ссылку и код. Открой ссылку в браузере (с телефона или
-       компьютера), войди под своим Google-аккаунтом, введи код, подтверди.
+    -> покажет ссылку. Открой её в браузере (с телефона или компьютера),
+       войди под своим Google-аккаунтом, разреши доступ.
+       Браузер попробует перейти на несуществующую страницу
+       (http://localhost:8080/...) и покажет ошибку типа
+       "не удаётся получить доступ к сайту" — это нормально и ожидаемо.
+       Нужно скопировать ПОЛНЫЙ адрес из адресной строки браузера в
+       этот момент (там будет виден код).
 
-Шаг 2 (после того как подтвердил в браузере):
-    python3 oauth_setup.py finish
-    -> напечатает refresh_token. Если ещё не успел подтвердить в браузере —
-       просто подожди несколько секунд и запусти finish ещё раз.
+Шаг 2:
+    python3 oauth_setup.py finish "ВСТАВЬ_СЮДА_СКОПИРОВАННЫЙ_АДРЕС"
+    -> напечатает refresh_token.
 
 Берёт Client ID и Client Secret из переменных окружения:
     GOOGLE_OAUTH_CLIENT_ID
     GOOGLE_OAUTH_CLIENT_SECRET
-(их нужно завести на bothost ДО запуска этого скрипта)
+(должны быть от OAuth-клиента типа "Web application" с зарегистрированным
+redirect URI: http://localhost:8080/callback)
 
 Никаких сторонних библиотек не требует — только стандартная библиотека Python.
 """
@@ -29,12 +38,10 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCOPES = "https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file"
-
-DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
-STATE_FILE = os.path.join(DATA_DIR, "oauth_device_flow.json")
+REDIRECT_URI = "http://localhost:8080/callback"
 
 CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
@@ -61,91 +68,94 @@ def cmd_start():
               "GOOGLE_OAUTH_CLIENT_SECRET. Добавь их на bothost и перезапусти бота.")
         return
 
-    print("Запрашиваю код у Google...")
-    device_resp = post_form(DEVICE_CODE_URL, {
+    params = {
         "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
         "scope": SCOPES,
-    })
-
-    if "error" in device_resp:
-        print(f"Ошибка: {device_resp}")
-        return
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump({"device_code": device_resp["device_code"]}, f)
-
-    user_code = device_resp["user_code"]
-    verification_url = device_resp.get("verification_url") or device_resp.get("verification_uri")
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
 
     print("\n" + "=" * 60)
-    print(f"1. Открой на телефоне или компьютере: {verification_url}")
-    print(f"2. Введи код: {user_code}")
-    print("3. Войди под своим Google-аккаунтом и разреши доступ")
+    print("Открой эту ссылку в браузере (с телефона или компьютера):\n")
+    print(url)
+    print("\n" + "=" * 60)
+    print("\n1. Войди под своим Google-аккаунтом, разреши доступ")
     print("   (появится предупреждение \"Google не проверил это приложение\" —")
-    print("    это нормально для личного использования, жми продолжить)")
-    print("=" * 60)
-    print("\nПосле подтверждения в браузере — запусти:")
-    print("    python3 oauth_setup.py finish")
+    print("    это нормально, жми продолжить)")
+    print("2. Браузер попытается перейти на несуществующую страницу и покажет")
+    print("   ошибку — это ожидаемо, ничего не сломалось")
+    print("3. Скопируй ПОЛНЫЙ адрес из адресной строки браузера в этот момент")
+    print("4. Запусти:")
+    print('   python3 oauth_setup.py finish "ВСТАВЬ_СКОПИРОВАННЫЙ_АДРЕС"')
 
 
-def cmd_finish():
-    if not os.path.exists(STATE_FILE):
-        print("Сначала запусти: python3 oauth_setup.py start")
+def extract_code(pasted: str) -> str:
+    """Достаёт code= из вставленного адреса или принимает голый код как есть."""
+    if "code=" in pasted:
+        parsed = urllib.parse.urlparse(pasted)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "code" in qs:
+            return qs["code"][0]
+    return pasted.strip()
+
+
+def cmd_finish(pasted: str):
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("Не заданы переменные окружения GOOGLE_OAUTH_CLIENT_ID / "
+              "GOOGLE_OAUTH_CLIENT_SECRET.")
         return
 
-    with open(STATE_FILE) as f:
-        state = json.load(f)
-    device_code = state["device_code"]
+    code = extract_code(pasted)
+    if not code:
+        print("Не нашёл code= в том, что вставили. Скопируй полный адрес "
+              "из браузера ещё раз.")
+        return
 
     token_resp = post_form(TOKEN_URL, {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
-        "device_code": device_code,
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": REDIRECT_URI,
     })
 
     error = token_resp.get("error")
-    if error == "authorization_pending":
-        print("Ещё не подтверждено в браузере. Подожди немного и запусти "
-              "finish ещё раз.")
-    elif error == "slow_down":
-        print("Google просит подождать подольше между попытками. "
-              "Подожди 10-15 секунд и запусти finish снова.")
-    elif error == "expired_token":
-        print("Код истёк (не успел подтвердить вовремя). Начни заново: "
-              "python3 oauth_setup.py start")
-        os.remove(STATE_FILE)
-    elif error == "access_denied":
-        print("Доступ отклонён в браузере.")
-        os.remove(STATE_FILE)
-    elif error:
+    if error:
         print(f"Ошибка: {token_resp}")
-    else:
-        refresh_token = token_resp.get("refresh_token")
-        if not refresh_token:
-            print("Google не вернул refresh_token. Возможно, доступ уже "
-                  "выдавался раньше — отзови его в Google-аккаунте "
-                  "(myaccount.google.com/permissions) и начни заново: "
-                  "python3 oauth_setup.py start")
-            return
-        print("✅ Готово! Вот твой refresh_token:\n")
-        print(refresh_token)
-        print("\nСкопируй это значение в переменную окружения "
-              "GOOGLE_OAUTH_REFRESH_TOKEN на bothost.")
-        os.remove(STATE_FILE)
+        print("\nЧастая причина — код уже был использован или устарел "
+              "(живёт недолго). Запусти заново: python3 oauth_setup.py start")
+        return
+
+    refresh_token = token_resp.get("refresh_token")
+    if not refresh_token:
+        print("Google не вернул refresh_token. Возможно, доступ уже "
+              "выдавался раньше без запроса нового refresh_token — "
+              "отзови его в Google-аккаунте (myaccount.google.com/permissions) "
+              "и начни заново: python3 oauth_setup.py start")
+        return
+
+    print("✅ Готово! Вот твой refresh_token:\n")
+    print(refresh_token)
+    print("\nСкопируй это значение в переменную окружения "
+          "GOOGLE_OAUTH_REFRESH_TOKEN на bothost.")
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("start", "finish"):
         print("Использование:")
-        print("    python3 oauth_setup.py start   — начать (покажет ссылку и код)")
-        print("    python3 oauth_setup.py finish  — завершить (после подтверждения в браузере)")
+        print("    python3 oauth_setup.py start")
+        print('    python3 oauth_setup.py finish "адрес_из_браузера"')
         return
     if sys.argv[1] == "start":
         cmd_start()
     else:
-        cmd_finish()
+        if len(sys.argv) < 3:
+            print('Нужно вставить адрес: python3 oauth_setup.py finish "адрес_из_браузера"')
+            return
+        cmd_finish(sys.argv[2])
 
 
 if __name__ == "__main__":
