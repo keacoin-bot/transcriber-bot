@@ -1,24 +1,30 @@
 """
 Одноразовый скрипт для получения refresh-токена Google (Device Flow).
 
-Запускать ОДИН РАЗ через терминал на bothost (иконка >_ на карточке бота).
-Ничего никуда не деплоить, просто запустить и следовать подсказкам.
+Терминал bothost показывает вывод только ПОСЛЕ завершения команды —
+поэтому скрипт разбит на ДВА коротких запуска вместо одного долгого:
 
-Как использовать:
-    python3 oauth_setup.py
+Шаг 1:
+    python3 oauth_setup.py start
+    -> покажет ссылку и код. Открой ссылку в браузере (с телефона или
+       компьютера), войди под своим Google-аккаунтом, введи код, подтверди.
 
-Скрипт спросит Client ID и Client Secret (из Google Cloud Console,
-раздел Credentials, тип "TVs and Limited Input devices" или "Desktop app").
-Дальше покажет ссылку и код — их нужно один раз открыть/ввести в браузере
-(с телефона или компьютера, не обязательно на том же устройстве).
-После подтверждения скрипт напечатает refresh_token — его нужно
-скопировать в переменную окружения GOOGLE_OAUTH_REFRESH_TOKEN на bothost.
+Шаг 2 (после того как подтвердил в браузере):
+    python3 oauth_setup.py finish
+    -> напечатает refresh_token. Если ещё не успел подтвердить в браузере —
+       просто подожди несколько секунд и запусти finish ещё раз.
+
+Берёт Client ID и Client Secret из переменных окружения:
+    GOOGLE_OAUTH_CLIENT_ID
+    GOOGLE_OAUTH_CLIENT_SECRET
+(их нужно завести на bothost ДО запуска этого скрипта)
 
 Никаких сторонних библиотек не требует — только стандартная библиотека Python.
 """
 
+import os
+import sys
 import json
-import time
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -26,6 +32,12 @@ import urllib.error
 DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCOPES = "https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive.file"
+
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+STATE_FILE = os.path.join(DATA_DIR, "oauth_device_flow.json")
+
+CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
 
 
 def post_form(url: str, data: dict) -> dict:
@@ -43,18 +55,15 @@ def post_form(url: str, data: dict) -> dict:
             raise RuntimeError(f"HTTP {e.code}: {error_body}")
 
 
-def main():
-    print("=== Получение refresh-токена Google (для Google Docs) ===\n")
-    client_id = input("Вставь Client ID: ").strip()
-    client_secret = input("Вставь Client Secret: ").strip()
-
-    if not client_id or not client_secret:
-        print("Client ID и Client Secret обязательны. Прерываю.")
+def cmd_start():
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("Не заданы переменные окружения GOOGLE_OAUTH_CLIENT_ID / "
+              "GOOGLE_OAUTH_CLIENT_SECRET. Добавь их на bothost и перезапусти бота.")
         return
 
-    print("\nЗапрашиваю код у Google...")
+    print("Запрашиваю код у Google...")
     device_resp = post_form(DEVICE_CODE_URL, {
-        "client_id": client_id,
+        "client_id": CLIENT_ID,
         "scope": SCOPES,
     })
 
@@ -62,11 +71,12 @@ def main():
         print(f"Ошибка: {device_resp}")
         return
 
-    device_code = device_resp["device_code"]
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump({"device_code": device_resp["device_code"]}, f)
+
     user_code = device_resp["user_code"]
     verification_url = device_resp.get("verification_url") or device_resp.get("verification_uri")
-    interval = device_resp.get("interval", 5)
-    expires_in = device_resp.get("expires_in", 1800)
 
     print("\n" + "=" * 60)
     print(f"1. Открой на телефоне или компьютере: {verification_url}")
@@ -75,49 +85,67 @@ def main():
     print("   (появится предупреждение \"Google не проверил это приложение\" —")
     print("    это нормально для личного использования, жми продолжить)")
     print("=" * 60)
-    print("\nЖду подтверждения...")
+    print("\nПосле подтверждения в браузере — запусти:")
+    print("    python3 oauth_setup.py finish")
 
-    waited = 0
-    while waited < expires_in:
-        time.sleep(interval)
-        waited += interval
 
-        token_resp = post_form(TOKEN_URL, {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "device_code": device_code,
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        })
+def cmd_finish():
+    if not os.path.exists(STATE_FILE):
+        print("Сначала запусти: python3 oauth_setup.py start")
+        return
 
-        error = token_resp.get("error")
-        if error == "authorization_pending":
-            continue
-        elif error == "slow_down":
-            interval += 5
-            continue
-        elif error == "expired_token":
-            print("\nКод истёк, запусти скрипт заново.")
-            return
-        elif error == "access_denied":
-            print("\nДоступ отклонён.")
-            return
-        elif error:
-            print(f"\nОшибка: {token_resp}")
-            return
-        else:
-            refresh_token = token_resp.get("refresh_token")
-            if not refresh_token:
-                print("\nGoogle не вернул refresh_token. Возможно, доступ уже "
-                      "выдавался раньше — отзови его в Google-аккаунте "
-                      "(myaccount.google.com/permissions) и запусти скрипт заново.")
-                return
-            print("\n✅ Готово! Вот твой refresh_token:\n")
-            print(refresh_token)
-            print("\nСкопируй это значение в переменную окружения "
-                  "GOOGLE_OAUTH_REFRESH_TOKEN на bothost.")
-            return
+    with open(STATE_FILE) as f:
+        state = json.load(f)
+    device_code = state["device_code"]
 
-    print("\nВремя ожидания истекло, запусти скрипт заново.")
+    token_resp = post_form(TOKEN_URL, {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "device_code": device_code,
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    })
+
+    error = token_resp.get("error")
+    if error == "authorization_pending":
+        print("Ещё не подтверждено в браузере. Подожди немного и запусти "
+              "finish ещё раз.")
+    elif error == "slow_down":
+        print("Google просит подождать подольше между попытками. "
+              "Подожди 10-15 секунд и запусти finish снова.")
+    elif error == "expired_token":
+        print("Код истёк (не успел подтвердить вовремя). Начни заново: "
+              "python3 oauth_setup.py start")
+        os.remove(STATE_FILE)
+    elif error == "access_denied":
+        print("Доступ отклонён в браузере.")
+        os.remove(STATE_FILE)
+    elif error:
+        print(f"Ошибка: {token_resp}")
+    else:
+        refresh_token = token_resp.get("refresh_token")
+        if not refresh_token:
+            print("Google не вернул refresh_token. Возможно, доступ уже "
+                  "выдавался раньше — отзови его в Google-аккаунте "
+                  "(myaccount.google.com/permissions) и начни заново: "
+                  "python3 oauth_setup.py start")
+            return
+        print("✅ Готово! Вот твой refresh_token:\n")
+        print(refresh_token)
+        print("\nСкопируй это значение в переменную окружения "
+              "GOOGLE_OAUTH_REFRESH_TOKEN на bothost.")
+        os.remove(STATE_FILE)
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ("start", "finish"):
+        print("Использование:")
+        print("    python3 oauth_setup.py start   — начать (покажет ссылку и код)")
+        print("    python3 oauth_setup.py finish  — завершить (после подтверждения в браузере)")
+        return
+    if sys.argv[1] == "start":
+        cmd_start()
+    else:
+        cmd_finish()
 
 
 if __name__ == "__main__":
