@@ -7,7 +7,7 @@
 Автор: Claude, для Евгения Касикова.
 """
 
-BOT_VERSION = "2026-09-03 v1"
+BOT_VERSION = "2026-09-06 v3"
 
 import os
 import re
@@ -22,8 +22,11 @@ from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
 
 import assemblyai as aai
+import anthropic
 import gspread
 from google.oauth2.service_account import Credentials as GoogleCredentials
+from google.oauth2.credentials import Credentials as OAuthCredentials
+from googleapiclient.discovery import build as gapi_build
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -35,6 +38,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    FSInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
 
@@ -44,6 +48,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+
+# Опционально — без них бот работает, просто без классификации и без Google Docs
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+GOOGLE_OAUTH_REFRESH_TOKEN = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN", "")
 
 ADMIN_IDS = [1064961867]  # Евгений (@kasikovevgenii)
 ALLOWED_USER_IDS = [1064961867]  # белый список пользователей бота
@@ -64,9 +74,28 @@ PRICE_PER_HOUR_BASE = 0.15
 PRICE_PER_HOUR_DIARIZATION_ADDON = 0.02
 
 SHEET_HEADERS = [
-    "Дата", "Источник", "Ссылка", "Название/тема", "Режим",
-    "Язык", "Кол-во спикеров", "Длительность (мин)", "Кол-во слов",
+    "Дата", "Источник", "Ссылка", "Название/тема", "Раздел", "Тема",
+    "Режим", "Язык", "Кол-во спикеров", "Длительность (мин)", "Кол-во слов",
     "Стоимость ($)", "Текст", "Статус",
+]
+
+CATEGORIES = ["Недвижимость/Флиппинг", "Психология", "ИИ/Технологии", "Другое"]
+
+CLASSIFY_MODEL = "claude-haiku-4-5-20251001"
+CLASSIFY_SYSTEM_PROMPT = (
+    "Ты классифицируешь транскрипцию по теме. Тебе дан фрагмент текста "
+    "(может быть начало длинной записи). Определи:\n"
+    '1. category — ОБЯЗАТЕЛЬНО один из: "Недвижимость/Флиппинг", "Психология", '
+    '"ИИ/Технологии", "Другое"\n'
+    "2. topic — короткая фраза на русском языке (3-6 слов), описывающая "
+    "конкретную тему записи по смыслу содержания\n\n"
+    "Ответь СТРОГО в формате JSON без markdown-разметки, без пояснений, только JSON:\n"
+    '{"category": "...", "topic": "..."}'
+)
+
+GOOGLE_DOC_SCOPES = [
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 URL_RE = re.compile(r"https?://\S+")
@@ -328,7 +357,179 @@ async def transcribe_audio(path: str, roles_mode: bool):
     return text, language, n_speakers
 
 
+# ============================== CLAUDE: КЛАССИФИКАЦИЯ ПО РАЗДЕЛУ/ТЕМЕ ==============================
+
+
+def _classify_sync(text_excerpt: str) -> dict:
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
+    response = client.messages.create(
+        model=CLASSIFY_MODEL,
+        max_tokens=150,
+        system=CLASSIFY_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": text_excerpt}],
+    )
+    raw = response.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+    data = json.loads(raw)
+    category = data.get("category", "Другое")
+    if category not in CATEGORIES:
+        category = "Другое"
+    topic = str(data.get("topic", ""))[:200]
+    return {"category": category, "topic": topic}
+
+
+async def classify_transcript(text: str) -> dict:
+    if not text or not ANTHROPIC_API_KEY:
+        return {"category": "", "topic": ""}
+    excerpt = text[:4000]
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_classify_sync, excerpt), timeout=60)
+    except Exception as e:
+        logger.error(f"Ошибка классификации: {e}")
+        return {"category": "Другое", "topic": ""}
+
+
+# ============================== GOOGLE DOCS: АРХИВ ДЛИННЫХ ЗАПИСЕЙ ==============================
+
+_docs_cache = {"service": None, "doc_id": None}
+
+
+def _get_docs_service():
+    if _docs_cache["service"] is not None:
+        return _docs_cache["service"]
+    creds = OAuthCredentials(
+        token=None,
+        refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
+        client_id=GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=GOOGLE_DOC_SCOPES,
+    )
+    service = gapi_build("docs", "v1", credentials=creds, cache_discovery=False)
+    _docs_cache["service"] = service
+    return service
+
+
+def _get_master_doc_id_sync(service) -> str:
+    if _docs_cache["doc_id"]:
+        return _docs_cache["doc_id"]
+    import shelve
+    with shelve.open(DB_PATH) as db:
+        doc_id = db.get("master_doc_id")
+    if not doc_id:
+        doc = service.documents().create(body={"title": "Транскрибатор — Архив"}).execute()
+        doc_id = doc["documentId"]
+        with shelve.open(DB_PATH) as db:
+            db["master_doc_id"] = doc_id
+    _docs_cache["doc_id"] = doc_id
+    return doc_id
+
+
+def _try_create_tab_sync(service, doc_id: str, tab_title: str):
+    """Пробует создать отдельную вкладку под запись. None, если API это не поддержало."""
+    try:
+        body = {"requests": [{"addDocumentTab": {"tabProperties": {"title": tab_title[:80]}}}]}
+        result = service.documents().batchUpdate(documentId=doc_id, body=body).execute()
+        for reply in result.get("replies", []):
+            add_reply = reply.get("addDocumentTab")
+            if add_reply:
+                tab_id = add_reply.get("tab", {}).get("tabProperties", {}).get("tabId")
+                if tab_id:
+                    return tab_id
+        return None
+    except Exception as e:
+        logger.info(f"Создание вкладки не удалось (использую заголовок в общем документе): {e}")
+        return None
+
+
+def _find_heading_id_sync(service, doc_id: str, heading_text: str):
+    """Ищет headingId только что вставленного заголовка. None, если не удалось найти."""
+    try:
+        doc = service.documents().get(documentId=doc_id).execute()
+        for element in doc.get("body", {}).get("content", []):
+            paragraph = element.get("paragraph")
+            if not paragraph:
+                continue
+            heading_id = paragraph.get("paragraphStyle", {}).get("headingId")
+            if not heading_id:
+                continue
+            text = "".join(
+                run.get("textRun", {}).get("content", "")
+                for run in paragraph.get("elements", [])
+            ).strip()
+            if text == heading_text.strip():
+                return heading_id
+        return None
+    except Exception as e:
+        logger.warning(f"Не удалось найти headingId: {e}")
+        return None
+
+
+def _add_entry_to_master_doc_sync(title: str, source_type: str, roles_mode: bool, text: str) -> str:
+    service = _get_docs_service()
+    doc_id = _get_master_doc_id_sync(service)
+    heading_text = (
+        f"{now_msk().strftime('%d.%m.%Y %H:%M')} — {title or source_type} "
+        f"({'по ролям' if roles_mode else 'обычная'})"
+    )
+
+    tab_id = _try_create_tab_sync(service, doc_id, title or source_type)
+    if tab_id:
+        requests = [{
+            "insertText": {
+                "location": {"tabId": tab_id, "index": 1},
+                "text": f"{heading_text}\n{text}",
+            }
+        }]
+        service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
+        return f"https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id}"
+
+    # Запасной путь — заголовок в общем документе
+    doc = service.documents().get(documentId=doc_id).execute()
+    content = doc.get("body", {}).get("content", [])
+    end_index = content[-1].get("endIndex", 1) if content else 1
+    insert_index = max(end_index - 1, 1)
+
+    requests = [
+        {"insertText": {"location": {"index": insert_index}, "text": f"{heading_text}\n{text}\n\n"}},
+        {
+            "updateParagraphStyle": {
+                "range": {"startIndex": insert_index, "endIndex": insert_index + len(heading_text)},
+                "paragraphStyle": {"namedStyleType": "HEADING_2"},
+                "fields": "namedStyleType",
+            }
+        },
+    ]
+    service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
+
+    heading_id = _find_heading_id_sync(service, doc_id, heading_text)
+    if heading_id:
+        return f"https://docs.google.com/document/d/{doc_id}/edit#heading={heading_id}"
+    return f"https://docs.google.com/document/d/{doc_id}/edit"
+
+
+async def add_entry_to_master_doc(title: str, source_type: str, roles_mode: bool, text: str):
+    if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REFRESH_TOKEN):
+        return None
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_add_entry_to_master_doc_sync, title, source_type, roles_mode, text),
+            timeout=120,
+        )
+    except Exception as e:
+        logger.error(f"Ошибка создания записи в Google Docs: {e}")
+        await notify_admin(f"Транскрибатор: не удалось создать запись в Google Docs: {e}")
+        return None
+
+
 # ============================== ОТПРАВКА ДЛИННОГО ТЕКСТА ==============================
+
+
+def make_txt_filename(title: str, source_type: str) -> str:
+    base = (title or source_type or "transcript").strip()
+    base = re.sub(r'[\\/:*?"<>|]+', "", base)
+    base = base[:80].strip() or "transcript"
+    return f"{base}.txt"
 
 
 def split_text(text: str, limit: int = 3500) -> list[str]:
@@ -390,22 +591,53 @@ async def finalize_result(
 
     if not text:
         await message.answer("Текст пустой — возможно, в записи нет речи.")
+        classification = {"category": "", "topic": ""}
+        sheet_text = ""
     else:
-        for chunk in split_text(text):
-            await message.answer(chunk, parse_mode=None)
+        classification = await classify_transcript(text)
+        parts = split_text(text)
+        if len(parts) == 1:
+            await message.answer(parts[0], parse_mode=None)
+            sheet_text = text
+        else:
+            # Не помещается в одно сообщение Telegram — шлём файлом, а не простынёй сообщений
+            filename = make_txt_filename(title, source_type)
+            tmp_txt_dir = tempfile.mkdtemp(prefix="trb_txt_")
+            try:
+                file_path = os.path.join(tmp_txt_dir, filename)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                await message.answer_document(FSInputFile(file_path, filename=filename))
+            except Exception as e:
+                logger.error(f"Ошибка отправки txt-файла: {e}")
+                # запасной путь — всё же отправить частями, чтобы текст не потерялся
+                for chunk in parts:
+                    await message.answer(chunk, parse_mode=None)
+            finally:
+                shutil.rmtree(tmp_txt_dir, ignore_errors=True)
+
+            doc_link = await add_entry_to_master_doc(title, source_type, roles_mode, text)
+            if doc_link:
+                await message.answer(f"📄 Полный текст также здесь: {doc_link}", parse_mode=None)
+                sheet_text = doc_link
+            else:
+                # Google Docs не настроен или не сработал — подстраховка от лимита ячейки Sheets (50000 симв.)
+                sheet_text = text[:49500] + "\n\n[...обрезано, лимит ячейки Google Sheets — полный текст в файле выше]"
 
     row = [
         now_msk().strftime("%Y-%m-%d %H:%M"),
         source_type,
         link or "",
         title or "",
+        classification.get("category", ""),
+        classification.get("topic", ""),
         "по ролям" if roles_mode else "обычная",
         language or "не определён",
         n_speakers if roles_mode else "",
         duration_min,
         word_count,
         cost,
-        text,
+        sheet_text,
         "готово",
     ]
     try:
@@ -417,6 +649,12 @@ async def finalize_result(
             "⚠️ Текст готов, но не получилось сохранить в таблицу — админ уведомлён."
         )
 
+    current_mode = get_user_mode(message.from_user.id)
+    await message.answer(
+        "Выберите режим для следующей записи:",
+        reply_markup=mode_keyboard(current_mode),
+    )
+
 
 async def save_error_row(source_type: str, link: str, title: str, roles_mode: bool, error_text: str):
     row = [
@@ -424,6 +662,7 @@ async def save_error_row(source_type: str, link: str, title: str, roles_mode: bo
         source_type,
         link or "",
         title or "",
+        "", "",
         "по ролям" if roles_mode else "обычная",
         "", "", "", "", "",
         f"ОШИБКА: {error_text[:500]}",
@@ -629,6 +868,14 @@ async def main():
     if missing:
         logger.error(f"Не заданы переменные окружения: {', '.join(missing)}")
         sys.exit(1)
+
+    optional_missing = []
+    if not ANTHROPIC_API_KEY:
+        optional_missing.append("ANTHROPIC_API_KEY (классификация по разделам отключена)")
+    if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REFRESH_TOKEN):
+        optional_missing.append("GOOGLE_OAUTH_* (создание Google Docs отключено)")
+    if optional_missing:
+        logger.warning("Опциональные функции отключены: " + "; ".join(optional_missing))
 
     logger.info(f"Транскрибатор запущен, версия {BOT_VERSION}")
     await notify_admin(f"🤖 Транскрибатор запущен, версия {BOT_VERSION}")

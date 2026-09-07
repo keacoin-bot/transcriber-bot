@@ -3,3 +3,5 @@ yt-dlp==2026.8.19
 assemblyai==1.1.0
 gspread==6.2.1
 google-auth==2.57.0
+anthropic==1.4.0
+google-api-python-client==2.200.0
