@@ -143,14 +143,44 @@ def cmd_finish(pasted: str):
           "GOOGLE_OAUTH_REFRESH_TOKEN на bothost.")
 
 
+def cmd_check():
+    """Диагностика: пробует обновить токен напрямую у Google, печатает сырой ответ."""
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("Не заданы GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET.")
+        return
+    refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN", "")
+    if not refresh_token:
+        print("Не задан GOOGLE_OAUTH_REFRESH_TOKEN.")
+        return
+
+    print(f"CLIENT_ID: {CLIENT_ID}")
+    print(f"CLIENT_ID длина: {len(CLIENT_ID)}")
+    print(f"CLIENT_SECRET длина: {len(CLIENT_SECRET)}")
+    print(f"REFRESH_TOKEN длина: {len(refresh_token)}")
+    print(f"REFRESH_TOKEN начало/конец: {refresh_token[:15]}...{refresh_token[-15:]}")
+    print()
+
+    resp = post_form(TOKEN_URL, {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    })
+    print("Сырой ответ Google:")
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("start", "finish"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("start", "finish", "check"):
         print("Использование:")
         print("    python3 oauth_setup.py start")
         print('    python3 oauth_setup.py finish "адрес_из_браузера"')
+        print("    python3 oauth_setup.py check   — диагностика текущего токена")
         return
     if sys.argv[1] == "start":
         cmd_start()
+    elif sys.argv[1] == "check":
+        cmd_check()
     else:
         if len(sys.argv) < 3:
             print('Нужно вставить адрес: python3 oauth_setup.py finish "адрес_из_браузера"')
