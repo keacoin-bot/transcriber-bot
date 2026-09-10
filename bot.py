@@ -7,7 +7,7 @@
 Автор: Claude, для Евгения Касикова.
 """
 
-BOT_VERSION = "2026-09-06 v3"
+BOT_VERSION = "2026-09-10 v5"
 
 import os
 import re
@@ -188,7 +188,7 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
 async def notify_admin(text: str):
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, text)
+            await bot.send_message(admin_id, text, parse_mode=None)
         except Exception as e:
             logger.error(f"notify_admin error (id={admin_id}): {e}")
 
@@ -425,21 +425,42 @@ def _get_master_doc_id_sync(service) -> str:
     return doc_id
 
 
-def _try_create_tab_sync(service, doc_id: str, tab_title: str):
-    """Пробует создать отдельную вкладку под запись. None, если API это не поддержало."""
+def _find_tab_id_by_title_sync(service, doc_id: str, title: str):
+    """Ищет id вкладки по её точному названию (берёт последнее совпадение —
+    считаем, что новая вкладка добавляется в конец списка). None, если не нашёл."""
     try:
-        body = {"requests": [{"addDocumentTab": {"tabProperties": {"title": tab_title[:80]}}}]}
-        result = service.documents().batchUpdate(documentId=doc_id, body=body).execute()
-        for reply in result.get("replies", []):
-            add_reply = reply.get("addDocumentTab")
-            if add_reply:
-                tab_id = add_reply.get("tab", {}).get("tabProperties", {}).get("tabId")
-                if tab_id:
-                    return tab_id
+        doc = service.documents().get(documentId=doc_id, includeTabsContent=True).execute()
+        matched_id = None
+        for tab in doc.get("tabs", []):
+            props = tab.get("tabProperties", {})
+            if props.get("title", "").strip() == title.strip():
+                matched_id = props.get("tabId")
+        return matched_id
+    except Exception as e:
+        logger.warning(f"Не удалось найти tabId по названию: {e}")
         return None
+
+
+def _try_create_tab_sync(service, doc_id: str, tab_title: str):
+    """Пробует создать отдельную вкладку под запись. None, если API это не поддержало.
+
+    Формат ответа на addDocumentTab — недокументированная часть API, ему не доверяем.
+    Надёжнее: создать вкладку, затем отдельно перечитать документ и найти её id
+    по названию, которое сами только что задали (тот же приём, что и для заголовков)."""
+    try:
+        body = {"requests": [{"addDocumentTab": {"tabProperties": {"title": tab_title}}}]}
+        service.documents().batchUpdate(documentId=doc_id, body=body).execute()
     except Exception as e:
         logger.info(f"Создание вкладки не удалось (использую заголовок в общем документе): {e}")
         return None
+
+    tab_id = _find_tab_id_by_title_sync(service, doc_id, tab_title)
+    if not tab_id:
+        logger.warning(
+            "Вкладка создана, но не удалось найти её id по названию — "
+            "использую заголовок в общем документе"
+        )
+    return tab_id
 
 
 def _find_heading_id_sync(service, doc_id: str, heading_text: str):
@@ -472,8 +493,11 @@ def _add_entry_to_master_doc_sync(title: str, source_type: str, roles_mode: bool
         f"{now_msk().strftime('%d.%m.%Y %H:%M')} — {title or source_type} "
         f"({'по ролям' if roles_mode else 'обычная'})"
     )
+    # Дата+время в названии вкладки — чтобы не совпадало с более старой вкладкой
+    # с таким же названием (иначе поиск по названию может найти не ту вкладку)
+    tab_title = f"{(title or source_type)[:60]} · {now_msk().strftime('%d.%m %H:%M')}"[:80]
 
-    tab_id = _try_create_tab_sync(service, doc_id, title or source_type)
+    tab_id = _try_create_tab_sync(service, doc_id, tab_title)
     if tab_id:
         requests = [{
             "insertText": {
@@ -757,7 +781,7 @@ async def process_link(message: Message, url: str):
     except ValueError as e:
         # предсказуемая ошибка (например, слишком длинный ролик) — без нотификации админу
         try:
-            await status_msg.edit_text(f"⚠️ {e}")
+            await status_msg.edit_text(f"⚠️ {e}", parse_mode=None)
         except TelegramBadRequest:
             pass
         await save_error_row(source_type, url, title, roles_mode, str(e))
@@ -765,7 +789,7 @@ async def process_link(message: Message, url: str):
         logger.exception("Ошибка обработки ссылки")
         await notify_admin(f"Транскрибатор: ошибка (ссылка {url}), user={user_id}: {e}")
         try:
-            await status_msg.edit_text(f"❌ Не получилось скачать или распознать: {str(e)[:300]}")
+            await status_msg.edit_text(f"❌ Не получилось скачать или распознать: {str(e)[:300]}", parse_mode=None)
         except TelegramBadRequest:
             pass
         await save_error_row(source_type, url, title, roles_mode, str(e))
