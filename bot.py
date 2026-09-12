@@ -7,7 +7,7 @@
 Автор: Claude, для Евгения Касикова.
 """
 
-BOT_VERSION = "2026-09-10 v5"
+BOT_VERSION = "2026-09-10 v6"
 
 import os
 import re
@@ -73,6 +73,11 @@ MAX_VOICE_FILE_MB = 20      # лимит Telegram Bot API на скачиван�
 PRICE_PER_HOUR_BASE = 0.15
 PRICE_PER_HOUR_DIARIZATION_ADDON = 0.02
 
+# Реальный лимит Google Sheets — 50000 символов в ячейке. Берём чуть меньше
+# для запаса. Если текст больше — даже при выбранном "Sheet" всё равно
+# создаём Google Docs, чтобы не обрезать содержимое.
+SHEET_CELL_LIMIT = 49500
+
 SHEET_HEADERS = [
     "Дата", "Источник", "Ссылка", "Название/тема", "Раздел", "Тема",
     "Режим", "Язык", "Кол-во спикеров", "Длительность (мин)", "Кол-во слов",
@@ -105,11 +110,15 @@ TIKTOK_RE = re.compile(r"tiktok\.com", re.I)
 
 WELCOME_TEXT = (
     "🎙 <b>Транскрибатор</b>\n\n"
-    "Выберите режим ниже, затем пришлите голосовое сообщение "
-    "или ссылку на YouTube / Instagram / TikTok.\n\n"
+    "Выберите режим и место сохранения ниже, затем пришлите голосовое "
+    "сообщение или ссылку на YouTube / Instagram / TikTok.\n\n"
     "• <b>Обычная</b> — просто текст\n"
     "• <b>По ролям</b> — с разметкой по спикерам "
-    "(для интервью, лекций, сессий)"
+    "(для интервью, лекций, сессий)\n\n"
+    "• <b>В Google Docs</b> — всегда отдельной записью в документе\n"
+    "• <b>В Google Sheet</b> — текст прямо в таблице (для коротких записей; "
+    "если текст окажется слишком длинным для ячейки — всё равно уйдёт в Docs, "
+    "чтобы не обрезать)"
 )
 
 # ============================== ЛОГИ ==============================
@@ -215,13 +224,29 @@ def set_user_mode(user_id: int, mode: str):
         db[f"mode_{user_id}"] = mode
 
 
-def mode_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+def get_user_destination(user_id: int) -> str:
+    import shelve
+    with shelve.open(DB_PATH) as db:
+        return db.get(f"dest_{user_id}", "sheet")
+
+
+def set_user_destination(user_id: int, destination: str):
+    import shelve
+    with shelve.open(DB_PATH) as db:
+        db[f"dest_{user_id}"] = destination
+
+
+def settings_keyboard(current_mode: str, current_destination: str) -> InlineKeyboardMarkup:
     normal_mark = "✅ " if current_mode == "normal" else ""
     roles_mark = "✅ " if current_mode == "roles" else ""
+    docs_mark = "✅ " if current_destination == "docs" else ""
+    sheet_mark = "✅ " if current_destination == "sheet" else ""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"{normal_mark}🎙 Обычная", callback_data="mode_normal")],
             [InlineKeyboardButton(text=f"{roles_mark}🗣 По ролям (спикеры)", callback_data="mode_roles")],
+            [InlineKeyboardButton(text=f"{docs_mark}📄 В Google Docs", callback_data="dest_docs")],
+            [InlineKeyboardButton(text=f"{sheet_mark}📊 В Google Sheet", callback_data="dest_sheet")],
         ]
     )
 
@@ -486,16 +511,28 @@ def _find_heading_id_sync(service, doc_id: str, heading_text: str):
         return None
 
 
-def _add_entry_to_master_doc_sync(title: str, source_type: str, roles_mode: bool, text: str) -> str:
+def _add_entry_to_master_doc_sync(
+    title: str, source_type: str, roles_mode: bool, text: str, topic: str = ""
+) -> str:
     service = _get_docs_service()
     doc_id = _get_master_doc_id_sync(service)
+
+    # Название записи: исходное название + тема от ИИ (если распознана),
+    # чтобы "Модуль 2.1" превращалось в "Модуль 2.1 — работа с возражениями",
+    # а не оставалось голым и неинформативным
+    base_name = title or source_type
+    if topic:
+        display_name = f"{base_name} — {topic}" if base_name else topic
+    else:
+        display_name = base_name
+
     heading_text = (
-        f"{now_msk().strftime('%d.%m.%Y %H:%M')} — {title or source_type} "
+        f"{now_msk().strftime('%d.%m.%Y %H:%M')} — {display_name} "
         f"({'по ролям' if roles_mode else 'обычная'})"
     )
     # Дата+время в названии вкладки — чтобы не совпадало с более старой вкладкой
     # с таким же названием (иначе поиск по названию может найти не ту вкладку)
-    tab_title = f"{(title or source_type)[:60]} · {now_msk().strftime('%d.%m %H:%M')}"[:80]
+    tab_title = f"{display_name[:60]} · {now_msk().strftime('%d.%m %H:%M')}"[:80]
 
     tab_id = _try_create_tab_sync(service, doc_id, tab_title)
     if tab_id:
@@ -532,12 +569,14 @@ def _add_entry_to_master_doc_sync(title: str, source_type: str, roles_mode: bool
     return f"https://docs.google.com/document/d/{doc_id}/edit"
 
 
-async def add_entry_to_master_doc(title: str, source_type: str, roles_mode: bool, text: str):
+async def add_entry_to_master_doc(
+    title: str, source_type: str, roles_mode: bool, text: str, topic: str = ""
+):
     if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REFRESH_TOKEN):
         return None
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_add_entry_to_master_doc_sync, title, source_type, roles_mode, text),
+            asyncio.to_thread(_add_entry_to_master_doc_sync, title, source_type, roles_mode, text, topic),
             timeout=120,
         )
     except Exception as e:
@@ -592,6 +631,7 @@ async def finalize_result(
     source_type: str,
     link: str,
     title: str,
+    destination: str,
 ):
     word_count = len(text.split()) if text else 0
     duration_min = round(duration_seconds / 60, 1) if duration_seconds else 0
@@ -619,12 +659,13 @@ async def finalize_result(
         sheet_text = ""
     else:
         classification = await classify_transcript(text)
+        topic = classification.get("topic", "")
         parts = split_text(text)
+
+        # В чат — сообщением или файлом, по тому, помещается ли в одно сообщение Telegram
         if len(parts) == 1:
             await message.answer(parts[0], parse_mode=None)
-            sheet_text = text
         else:
-            # Не помещается в одно сообщение Telegram — шлём файлом, а не простынёй сообщений
             filename = make_txt_filename(title, source_type)
             tmp_txt_dir = tempfile.mkdtemp(prefix="trb_txt_")
             try:
@@ -640,13 +681,19 @@ async def finalize_result(
             finally:
                 shutil.rmtree(tmp_txt_dir, ignore_errors=True)
 
-            doc_link = await add_entry_to_master_doc(title, source_type, roles_mode, text)
+        # Куда сохраняем: по выбору пользователя (Docs/Sheet), но если выбран Sheet
+        # и текст не влезает в ячейку — всё равно уходит в Docs, чтобы не обрезать
+        needs_docs = destination == "docs" or len(text) > SHEET_CELL_LIMIT
+        if needs_docs:
+            doc_link = await add_entry_to_master_doc(title, source_type, roles_mode, text, topic)
             if doc_link:
-                await message.answer(f"📄 Полный текст также здесь: {doc_link}", parse_mode=None)
+                await message.answer(f"📄 Сохранено в Google Docs: {doc_link}", parse_mode=None)
                 sheet_text = doc_link
             else:
-                # Google Docs не настроен или не сработал — подстраховка от лимита ячейки Sheets (50000 симв.)
-                sheet_text = text[:49500] + "\n\n[...обрезано, лимит ячейки Google Sheets — полный текст в файле выше]"
+                # Google Docs не настроен или не сработал — подстраховка от лимита ячейки Sheets
+                sheet_text = text[:SHEET_CELL_LIMIT] + "\n\n[...обрезано, лимит ячейки Google Sheets — Docs не создался]"
+        else:
+            sheet_text = text
 
     row = [
         now_msk().strftime("%Y-%m-%d %H:%M"),
@@ -674,9 +721,10 @@ async def finalize_result(
         )
 
     current_mode = get_user_mode(message.from_user.id)
+    current_destination = get_user_destination(message.from_user.id)
     await message.answer(
-        "Выберите режим для следующей записи:",
-        reply_markup=mode_keyboard(current_mode),
+        "Выберите режим и место сохранения для следующей записи:",
+        reply_markup=settings_keyboard(current_mode, current_destination),
     )
 
 
@@ -705,6 +753,7 @@ async def process_voice(message: Message):
     user_id = message.from_user.id
     mode = get_user_mode(user_id)
     roles_mode = mode == "roles"
+    destination = get_user_destination(user_id)
     voice = message.voice
 
     if voice.file_size and voice.file_size > MAX_VOICE_FILE_MB * 1024 * 1024:
@@ -725,6 +774,7 @@ async def process_voice(message: Message):
         await finalize_result(
             message, status_msg, text, language, n_speakers, duration,
             roles_mode, source_type="голосовое", link="", title=title,
+            destination=destination,
         )
     except Exception as e:
         logger.exception("Ошибка обработки голосового")
@@ -759,6 +809,7 @@ async def process_link(message: Message, url: str):
     user_id = message.from_user.id
     mode = get_user_mode(user_id)
     roles_mode = mode == "roles"
+    destination = get_user_destination(user_id)
     source_type = detect_source(url)
 
     status_msg = await message.answer(f"⏳ Скачиваю аудио с {source_type}...")
@@ -777,6 +828,7 @@ async def process_link(message: Message, url: str):
         await finalize_result(
             message, status_msg, text, language, n_speakers, duration,
             roles_mode, source_type, link=url, title=title,
+            destination=destination,
         )
     except ValueError as e:
         # предсказуемая ошибка (например, слишком длинный ролик) — без нотификации админу
@@ -808,7 +860,8 @@ async def cmd_start(message: Message):
         logger.warning(f"Попытка доступа: user_id={user_id} username={message.from_user.username}")
         return
     mode = get_user_mode(user_id)
-    await message.answer(WELCOME_TEXT, reply_markup=mode_keyboard(mode))
+    destination = get_user_destination(user_id)
+    await message.answer(WELCOME_TEXT, reply_markup=settings_keyboard(mode, destination))
 
 
 @dp.message(Command("version"))
@@ -825,12 +878,29 @@ async def cb_mode(cb: CallbackQuery):
         return
     mode = "normal" if cb.data == "mode_normal" else "roles"
     set_user_mode(cb.from_user.id, mode)
+    destination = get_user_destination(cb.from_user.id)
     try:
-        await cb.message.edit_text(WELCOME_TEXT, reply_markup=mode_keyboard(mode))
+        await cb.message.edit_text(WELCOME_TEXT, reply_markup=settings_keyboard(mode, destination))
     except TelegramBadRequest as e:
         if "not modified" not in str(e).lower():
             logger.warning(f"cb_mode edit_text error: {e}")
     await cb.answer(f"Режим: {'обычная' if mode == 'normal' else 'по ролям'}")
+
+
+@dp.callback_query(F.data.in_({"dest_docs", "dest_sheet"}))
+async def cb_destination(cb: CallbackQuery):
+    if not is_allowed(cb.from_user.id):
+        await cb.answer("Доступ закрыт", show_alert=True)
+        return
+    destination = "docs" if cb.data == "dest_docs" else "sheet"
+    set_user_destination(cb.from_user.id, destination)
+    mode = get_user_mode(cb.from_user.id)
+    try:
+        await cb.message.edit_text(WELCOME_TEXT, reply_markup=settings_keyboard(mode, destination))
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"cb_destination edit_text error: {e}")
+    await cb.answer(f"Сохранение: {'Google Docs' if destination == 'docs' else 'Google Sheet'}")
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
