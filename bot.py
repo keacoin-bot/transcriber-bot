@@ -7,7 +7,7 @@
 Автор: Claude, для Евгения Касикова.
 """
 
-BOT_VERSION = "2026-09-13 v8"
+BOT_VERSION = "2026-09-13 v9"
 
 import os
 import re
@@ -656,7 +656,11 @@ def _add_entry_to_master_doc_sync(
     heading_text = f"{now_msk().strftime('%d.%m.%Y %H:%M')} — {display_name}"
     # Дата+время в названии вкладки — чтобы не совпадало с более старой вкладкой
     # с таким же названием (иначе поиск по названию может найти не ту вкладку)
-    tab_title = f"{display_name[:60]} · {now_msk().strftime('%d.%m %H:%M')}"[:80]
+    # Реальный лимит Google на название вкладки — 50 символов (подтверждено
+    # прямой ошибкой API: "The tab title cannot be longer than 50 characters").
+    # Раньше здесь стояло 80 — неверное предположение, роняло создание вкладки
+    # на любом чуть более длинном названии/теме
+    tab_title = f"{display_name[:34]} · {now_msk().strftime('%d.%m %H:%M')}"[:50]
 
     tab_id = _try_create_tab_sync(service, doc_id, tab_title)
     if tab_id:
