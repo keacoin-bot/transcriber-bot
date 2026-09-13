@@ -7,7 +7,7 @@
 Автор: Claude, для Евгения Касикова.
 """
 
-BOT_VERSION = "2026-09-13 v9"
+BOT_VERSION = "2026-09-13 v10"
 
 import os
 import re
@@ -741,7 +741,12 @@ def _add_entry_to_master_doc_sync(
                 }]},
             ).execute()
 
-        return f"https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id}"
+        # В реальных ссылках Google id вкладки в URL выглядит как "t.0",
+        # "t.abc123" и т.п. Добавляем префикс "t.", только если его там
+        # ещё нет — сам id внутри API уже работает верно (текст и таблица
+        # попадают в нужную вкладку), возможно дело было только в ссылке
+        url_tab_id = tab_id if tab_id.startswith("t.") else f"t.{tab_id}"
+        return f"https://docs.google.com/document/d/{doc_id}/edit?tab={url_tab_id}"
 
     # Запасной путь — заголовок в общем документе
     doc = service.documents().get(documentId=doc_id).execute()
