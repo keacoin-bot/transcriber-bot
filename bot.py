@@ -7,7 +7,7 @@
 Автор: Claude, для Евгения Касикова.
 """
 
-BOT_VERSION = "2026-09-11 v7"
+BOT_VERSION = "2026-09-13 v8"
 
 import os
 import re
@@ -403,7 +403,13 @@ def rows_to_text(rows: list[dict]) -> str:
 
 
 async def transcribe_audio(path: str):
-    """Возвращает (текст, язык, кол-во_спикеров, строки_с_таймингами).
+    """Возвращает (текст, язык, кол-во_спикеров, строки_с_таймингами, длительность_сек).
+
+    Длительность берём из самого AssemblyAI (audio_duration) — она измерена
+    по факту обработанного файла, а не из метаданных источника (yt-dlp для
+    части сайтов, например Instagram, иногда не отдаёт длительность вовсе,
+    из-за чего раньше показывалось "0 мин" и запись неверно уходила в Docs
+    вместо текста в ячейке).
 
     Если спикер один — текст сплошной, строки всё равно собираются
     (могут пригодиться), но таблица по ним не строится."""
@@ -418,6 +424,8 @@ async def transcribe_audio(path: str):
     except Exception:
         language = None
 
+    duration_seconds = transcript.audio_duration or 0
+
     utterances = transcript.utterances or []
     n_speakers = len(set(u.speaker for u in utterances)) if utterances else 0
     rows = build_rows_with_pauses(utterances) if utterances else []
@@ -430,7 +438,7 @@ async def transcribe_audio(path: str):
         # текст без меток: для записей на объекте, голосовых, лекций так удобнее
         text = transcript.text or ""
 
-    return text, language, n_speakers, rows
+    return text, language, n_speakers, rows, duration_seconds
 
 
 # ============================== CLAUDE: КЛАССИФИКАЦИЯ ПО РАЗДЕЛУ/ТЕМЕ ==============================
@@ -562,15 +570,10 @@ def _find_heading_id_sync(service, doc_id: str, heading_text: str):
         return None
 
 
-def _build_table_requests(rows: list[dict], tab_id: str | None, start_index: int) -> list[dict]:
-    """Формирует запросы для вставки таблицы таймингов.
-
-    Google Docs API не даёт вставить таблицу сразу с содержимым: сначала
-    создаётся пустая таблица, потом текст вставляется в ячейки. Индексы ячеек
-    приходится пересчитывать, поэтому заполнение идёт ОТ КОНЦА к началу —
-    так вставка текста не сдвигает индексы ещё не заполненных ячеек."""
+def _build_table_values(rows: list[dict]) -> list[list[str]]:
+    """Значения для таблицы таймингов: заголовок + строка на фразу/паузу."""
     header = ["Время", "Длит.", "Спикер", "Текст"]
-    table_rows = [header] + [
+    return [header] + [
         [
             f"{format_timestamp(r['start'])}–{format_timestamp(r['end'])}",
             format_duration(r["duration"]),
@@ -580,37 +583,59 @@ def _build_table_requests(rows: list[dict], tab_id: str | None, start_index: int
         for r in rows
     ]
 
-    location = {"index": start_index}
-    if tab_id:
-        location["tabId"] = tab_id
 
-    requests = [{
-        "insertTable": {
-            "location": location,
-            "rows": len(table_rows),
-            "columns": len(header),
-        }
-    }]
+def _find_table_cell_indices_sync(service, doc_id: str, tab_id: str) -> list[list[int | None]] | None:
+    """Находит РЕАЛЬНЫЕ индексы ячеек только что созданной таблицы.
 
-    # Пустая таблица занимает предсказуемое число индексов:
-    # сама таблица +1, каждая строка +1, каждая ячейка +2 (параграф внутри)
-    cell_positions = []
-    idx = start_index + 1  # +1: начало таблицы
-    for row_values in table_rows:
-        idx += 1  # начало строки
-        for value in row_values:
-            cell_positions.append((idx + 1, value))
-            idx += 2  # пустая ячейка = 2 индекса
-    # Заполняем от конца к началу, чтобы индексы не съезжали
-    for cell_index, value in reversed(cell_positions):
-        if not value:
-            continue
-        cell_location = {"index": cell_index}
-        if tab_id:
-            cell_location["tabId"] = tab_id
-        requests.append({"insertText": {"location": cell_location, "text": value}})
+    Раньше индексы вычислялись арифметикой (таблица+1, строка+1, ячейка+2) —
+    это оказалось неверным предположением о внутренней структуре и роняло
+    вставку текста с ошибкой 'insertion index must be inside the bounds of
+    an existing paragraph'. Правильный способ — тот же, что уже используется
+    для headingId: перечитать документ и взять индексы из его реальной
+    структуры, не гадать."""
+    try:
+        doc = service.documents().get(documentId=doc_id, includeTabsContent=True).execute()
+        for tab in doc.get("tabs", []):
+            if tab.get("tabProperties", {}).get("tabId") != tab_id:
+                continue
+            body = tab.get("documentTab", {}).get("body", {})
+            for element in body.get("content", []):
+                table = element.get("table")
+                if not table:
+                    continue
+                cell_indices = []
+                for table_row in table.get("tableRows", []):
+                    row_indices = []
+                    for cell in table_row.get("tableCells", []):
+                        cell_content = cell.get("content", [])
+                        # Пустая ячейка — один пустой параграф; startIndex этого
+                        # параграфа и есть точка вставки текста в ячейку
+                        start = cell_content[0].get("startIndex") if cell_content else None
+                        row_indices.append(start)
+                    cell_indices.append(row_indices)
+                return cell_indices
+        return None
+    except Exception as e:
+        logger.warning(f"Не удалось найти индексы ячеек таблицы: {e}")
+        return None
 
-    return requests
+
+def _get_tab_end_index_sync(service, doc_id: str, tab_id: str) -> int:
+    """Реальный конец содержимого вкладки — для безопасной вставки текста
+    в конец, даже если до этого что-то уже было вставлено (например, пустая
+    таблица, если её не удалось заполнить)."""
+    try:
+        doc = service.documents().get(documentId=doc_id, includeTabsContent=True).execute()
+        for tab in doc.get("tabs", []):
+            if tab.get("tabProperties", {}).get("tabId") != tab_id:
+                continue
+            content = tab.get("documentTab", {}).get("body", {}).get("content", [])
+            end_index = content[-1].get("endIndex", 1) if content else 1
+            return max(end_index - 1, 1)
+        return 1
+    except Exception as e:
+        logger.warning(f"Не удалось определить конец вкладки: {e}")
+        return 1
 
 
 def _add_entry_to_master_doc_sync(
@@ -649,19 +674,54 @@ def _add_entry_to_master_doc_sync(
         body_index = 1 + len(heading_text) + 1
         if rows:
             try:
-                table_requests = _build_table_requests(rows, tab_id, body_index)
+                table_values = _build_table_values(rows)
+                # Шаг 1: создаём пустую таблицу
                 service.documents().batchUpdate(
-                    documentId=doc_id, body={"requests": table_requests}
+                    documentId=doc_id,
+                    body={"requests": [{
+                        "insertTable": {
+                            "location": {"tabId": tab_id, "index": body_index},
+                            "rows": len(table_values),
+                            "columns": len(table_values[0]),
+                        }
+                    }]},
                 ).execute()
+
+                # Шаг 2: перечитываем документ и берём РЕАЛЬНЫЕ индексы ячеек —
+                # не угадываем структуру (это и было причиной прошлой ошибки)
+                cell_indices = _find_table_cell_indices_sync(service, doc_id, tab_id)
+                if not cell_indices:
+                    raise RuntimeError("не удалось найти индексы ячеек только что созданной таблицы")
+
+                fill_requests = []
+                for row_values, row_indices in zip(table_values, cell_indices):
+                    for value, cell_index in zip(row_values, row_indices):
+                        if value and cell_index is not None:
+                            fill_requests.append({
+                                "insertText": {
+                                    "location": {"tabId": tab_id, "index": cell_index},
+                                    "text": value,
+                                }
+                            })
+                # От конца к началу — иначе каждая вставка сдвигает индексы
+                # ещё не заполненных ячеек, прочитанные на шаге 2
+                fill_requests.reverse()
+                if fill_requests:
+                    service.documents().batchUpdate(
+                        documentId=doc_id, body={"requests": fill_requests}
+                    ).execute()
             except Exception as e:
-                # Таблица не собралась (много строк, лимиты API, сдвиг индексов) —
-                # не теряем запись: кладём тот же контент текстом с таймингами
+                # Таблица не собралась (лимиты API, сотни строк) — не теряем
+                # запись: кладём тот же контент текстом с таймингами. Вставляем
+                # в РЕАЛЬНЫЙ конец вкладки (не в body_index — там уже может
+                # быть пустая недозаполненная таблица)
                 logger.warning(f"Не удалось построить таблицу таймингов, пишу текстом: {e}")
+                safe_index = _get_tab_end_index_sync(service, doc_id, tab_id)
                 service.documents().batchUpdate(
                     documentId=doc_id,
                     body={"requests": [{
                         "insertText": {
-                            "location": {"tabId": tab_id, "index": body_index},
+                            "location": {"tabId": tab_id, "index": safe_index},
                             "text": text,
                         }
                     }]},
@@ -818,7 +878,11 @@ async def finalize_result(
         )
 
         # 3. В ячейку таблицы: короткие записи целиком, длинные — ссылкой на Docs
-        is_short = duration_seconds and duration_seconds <= SHEET_TEXT_MAX_DURATION_SEC
+        # ВАЖНО: без "duration_seconds and" — при 0 (например, коротком клипе
+        # без определённой длительности) старая проверка "0 and ..." ложно
+        # давала False из-за особенности Python, и запись уходила в Docs
+        # вместо текста в ячейке. 0 секунд — тоже короткая запись.
+        is_short = duration_seconds <= SHEET_TEXT_MAX_DURATION_SEC
         if is_short and len(text) <= SHEET_CELL_LIMIT:
             sheet_text = text
         elif doc_link:
@@ -903,9 +967,11 @@ async def process_voice(message: Message):
     try:
         local_path = os.path.join(tmp_dir, "voice.oga")
         await bot.download(voice, destination=local_path)
-        duration = voice.duration or 0
+        duration_fallback = voice.duration or 0
 
-        text, language, n_speakers, rows = await transcribe_audio(local_path)
+        text, language, n_speakers, rows, ai_duration = await transcribe_audio(local_path)
+        # Длительность от AssemblyAI приоритетнее — измерена по факту файла
+        duration = ai_duration or duration_fallback
         await finalize_result(
             message, status_msg, text, language, n_speakers, duration,
             source_type="голосовое", link="", title=title, rows=rows,
@@ -947,12 +1013,12 @@ async def process_link(message: Message, url: str):
     tmp_dir = tempfile.mkdtemp(prefix="trb_")
     title = ""
     try:
-        local_path, duration, title = await asyncio.to_thread(
+        local_path, duration_fallback, title = await asyncio.to_thread(
             download_audio_via_ytdlp_guarded, url, tmp_dir
         )
         # На длинных записях показываем ожидаемое время, чтобы не казалось, что бот завис
-        if duration:
-            eta_min = max(int(duration / 60 / 3), 1)
+        if duration_fallback:
+            eta_min = max(int(duration_fallback / 60 / 3), 1)
             status_text = f"⏳ Распознаю текст... (примерно {eta_min} мин)"
         else:
             status_text = "⏳ Распознаю текст..."
@@ -961,7 +1027,10 @@ async def process_link(message: Message, url: str):
         except TelegramBadRequest:
             pass
 
-        text, language, n_speakers, rows = await transcribe_audio(local_path)
+        text, language, n_speakers, rows, ai_duration = await transcribe_audio(local_path)
+        # Длительность от AssemblyAI приоритетнее — метаданные yt-dlp (особенно
+        # у Instagram) иногда её вообще не отдают, раньше это давало "0 мин"
+        duration = ai_duration or duration_fallback
         await finalize_result(
             message, status_msg, text, language, n_speakers, duration,
             source_type, link=url, title=title, rows=rows,
