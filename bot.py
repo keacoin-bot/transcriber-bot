@@ -7,7 +7,7 @@
 Автор: Claude, для Евгения Касикова.
 """
 
-BOT_VERSION = "2026-09-10 v6"
+BOT_VERSION = "2026-09-11 v7"
 
 import os
 import re
@@ -35,9 +35,6 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     ErrorEvent,
     Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     FSInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
@@ -78,6 +75,13 @@ PRICE_PER_HOUR_DIARIZATION_ADDON = 0.02
 # создаём Google Docs, чтобы не обрезать содержимое.
 SHEET_CELL_LIMIT = 49500
 
+# Паузы длиннее этого порога попадают отдельной строкой в таблицу таймингов
+PAUSE_THRESHOLD_MS = 15_000
+
+# Записи короче этого — текст прямо в ячейку таблицы (удобно копировать,
+# это про reels/шортсы). Длиннее — в ячейку идёт ссылка на вкладку в Docs
+SHEET_TEXT_MAX_DURATION_SEC = 180
+
 SHEET_HEADERS = [
     "Дата", "Источник", "Ссылка", "Название/тема", "Раздел", "Тема",
     "Режим", "Язык", "Кол-во спикеров", "Длительность (мин)", "Кол-во слов",
@@ -110,15 +114,15 @@ TIKTOK_RE = re.compile(r"tiktok\.com", re.I)
 
 WELCOME_TEXT = (
     "🎙 <b>Транскрибатор</b>\n\n"
-    "Выберите режим и место сохранения ниже, затем пришлите голосовое "
-    "сообщение или ссылку на YouTube / Instagram / TikTok.\n\n"
-    "• <b>Обычная</b> — просто текст\n"
-    "• <b>По ролям</b> — с разметкой по спикерам "
-    "(для интервью, лекций, сессий)\n\n"
-    "• <b>В Google Docs</b> — всегда отдельной записью в документе\n"
-    "• <b>В Google Sheet</b> — текст прямо в таблице (для коротких записей; "
-    "если текст окажется слишком длинным для ячейки — всё равно уйдёт в Docs, "
-    "чтобы не обрезать)"
+    "Просто пришлите голосовое сообщение или ссылку на "
+    "YouTube / Instagram / TikTok — ничего настраивать не нужно.\n\n"
+    "Что будет на выходе:\n"
+    "• текст файлом прямо в чат\n"
+    "• запись отдельной вкладкой в Google Docs\n"
+    "• строка в таблице Google Sheets\n\n"
+    "Если в записи несколько собеседников — бот сам разметит реплики "
+    "по спикерам и соберёт таблицу с таймингами и паузами. "
+    "Если говорит один — просто чистый текст."
 )
 
 # ============================== ЛОГИ ==============================
@@ -209,48 +213,6 @@ def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-# ============================== РЕЖИМ ПОЛЬЗОВАТЕЛЯ (shelve) ==============================
-
-
-def get_user_mode(user_id: int) -> str:
-    import shelve
-    with shelve.open(DB_PATH) as db:
-        return db.get(f"mode_{user_id}", "normal")
-
-
-def set_user_mode(user_id: int, mode: str):
-    import shelve
-    with shelve.open(DB_PATH) as db:
-        db[f"mode_{user_id}"] = mode
-
-
-def get_user_destination(user_id: int) -> str:
-    import shelve
-    with shelve.open(DB_PATH) as db:
-        return db.get(f"dest_{user_id}", "sheet")
-
-
-def set_user_destination(user_id: int, destination: str):
-    import shelve
-    with shelve.open(DB_PATH) as db:
-        db[f"dest_{user_id}"] = destination
-
-
-def settings_keyboard(current_mode: str, current_destination: str) -> InlineKeyboardMarkup:
-    normal_mark = "✅ " if current_mode == "normal" else ""
-    roles_mark = "✅ " if current_mode == "roles" else ""
-    docs_mark = "✅ " if current_destination == "docs" else ""
-    sheet_mark = "✅ " if current_destination == "sheet" else ""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"{normal_mark}🎙 Обычная", callback_data="mode_normal")],
-            [InlineKeyboardButton(text=f"{roles_mark}🗣 По ролям (спикеры)", callback_data="mode_roles")],
-            [InlineKeyboardButton(text=f"{docs_mark}📄 В Google Docs", callback_data="dest_docs")],
-            [InlineKeyboardButton(text=f"{sheet_mark}📊 В Google Sheet", callback_data="dest_sheet")],
-        ]
-    )
-
-
 # ============================== GOOGLE SHEETS ==============================
 
 _sheet_cache = {"ws": None}
@@ -283,13 +245,29 @@ def _ensure_headers(ws):
         ws.update("A1", [SHEET_HEADERS])
 
 
-def _append_row_sync(row: list):
+def _append_row_sync(row: list) -> str | None:
+    """Добавляет строку и возвращает ссылку прямо на неё (не на таблицу целиком)."""
     ws = _get_worksheet()
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    result = ws.append_row(row, value_input_option="USER_ENTERED")
+    try:
+        # Ответ Google содержит диапазон вида "Транскрипты!A42:N42" —
+        # достаём оттуда номер строки, отдельный запрос не нужен
+        updated_range = result.get("updates", {}).get("updatedRange", "")
+        match = re.search(r"![A-Z]+(\d+)", updated_range)
+        if not match:
+            return None
+        row_number = match.group(1)
+        return (
+            f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}"
+            f"/edit#gid={ws.id}&range=A{row_number}"
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось собрать ссылку на строку таблицы: {e}")
+        return None
 
 
-async def append_transcript_row(row: list):
-    await asyncio.to_thread(_append_row_sync, row)
+async def append_transcript_row(row: list) -> str | None:
+    return await asyncio.to_thread(_append_row_sync, row)
 
 
 # ============================== yt-dlp: СКАЧИВАНИЕ ==============================
@@ -347,10 +325,13 @@ def download_audio_via_ytdlp_guarded(url: str, out_dir: str):
 # ============================== ASSEMBLYAI: ТРАНСКРИПЦИЯ ==============================
 
 
-def _transcribe_sync(path: str, roles_mode: bool):
+def _transcribe_sync(path: str):
+    # Диаризация включена ВСЕГДА: стоит +$0.02/час (копейки), зато не нужно
+    # заранее выбирать режим и невозможно ошибиться. Если спикер окажется
+    # один — просто отдаём сплошной текст, как в "обычном" режиме.
     config = aai.TranscriptionConfig(
         language_detection=True,
-        speaker_labels=roles_mode,
+        speaker_labels=True,
     )
     transcript = aai.Transcriber(config=config).transcribe(path)
     if transcript.status == aai.TranscriptStatus.error:
@@ -358,10 +339,76 @@ def _transcribe_sync(path: str, roles_mode: bool):
     return transcript
 
 
-async def transcribe_audio(path: str, roles_mode: bool):
-    """Возвращает (текст, язык, кол-во_спикеров)."""
+def format_timestamp(ms: int) -> str:
+    """Миллисекунды → ЧЧ:ММ:СС или ММ:СС (часы только если запись длиннее часа)."""
+    total_seconds = int(ms / 1000)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_duration(ms: int) -> str:
+    """Длительность в человекочитаемом виде."""
+    total_seconds = max(int(round(ms / 1000)), 0)
+    if total_seconds < 60:
+        return f"{total_seconds} сек"
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    if seconds:
+        return f"{minutes} мин {seconds} сек"
+    return f"{minutes} мин"
+
+
+def build_rows_with_pauses(utterances, pause_threshold_ms: int = PAUSE_THRESHOLD_MS) -> list[dict]:
+    """Собирает строки для таблицы: фразы спикеров + паузы длиннее порога.
+
+    Каждая строка: {start, end, duration, speaker, text}, где для паузы
+    speaker == "Пауза", а text пустой."""
+    rows = []
+    prev_end = None
+    for u in utterances:
+        if prev_end is not None and (u.start - prev_end) >= pause_threshold_ms:
+            rows.append({
+                "start": prev_end,
+                "end": u.start,
+                "duration": u.start - prev_end,
+                "speaker": "Пауза",
+                "text": "",
+            })
+        rows.append({
+            "start": u.start,
+            "end": u.end,
+            "duration": u.end - u.start,
+            "speaker": f"Спикер {u.speaker}",
+            "text": u.text,
+        })
+        prev_end = u.end
+    return rows
+
+
+def rows_to_text(rows: list[dict]) -> str:
+    """Текстовый вид строк с таймингами — для .txt файла и запасного пути,
+    если таблицу в Google Docs построить не удалось."""
+    lines = []
+    for r in rows:
+        head = (
+            f"[{format_timestamp(r['start'])}–{format_timestamp(r['end'])}, "
+            f"{format_duration(r['duration'])}] {r['speaker']}"
+        )
+        lines.append(head if not r["text"] else f"{head}: {r['text']}")
+    return "\n\n".join(lines)
+
+
+async def transcribe_audio(path: str):
+    """Возвращает (текст, язык, кол-во_спикеров, строки_с_таймингами).
+
+    Если спикер один — текст сплошной, строки всё равно собираются
+    (могут пригодиться), но таблица по ним не строится."""
     transcript = await asyncio.wait_for(
-        asyncio.to_thread(_transcribe_sync, path, roles_mode),
+        asyncio.to_thread(_transcribe_sync, path),
         timeout=1800,  # 30 минут — защита от зависшего запроса
     )
 
@@ -371,15 +418,19 @@ async def transcribe_audio(path: str, roles_mode: bool):
     except Exception:
         language = None
 
-    n_speakers = 0
-    if roles_mode and transcript.utterances:
-        speakers = sorted(set(u.speaker for u in transcript.utterances))
-        n_speakers = len(speakers)
-        text = "\n\n".join(f"Спикер {u.speaker}: {u.text}" for u in transcript.utterances)
+    utterances = transcript.utterances or []
+    n_speakers = len(set(u.speaker for u in utterances)) if utterances else 0
+    rows = build_rows_with_pauses(utterances) if utterances else []
+
+    if n_speakers > 1:
+        # Несколько собеседников — размечаем по ролям, с таймингами
+        text = rows_to_text(rows)
     else:
+        # Монолог (или диаризация не нашла разных голосов) — чистый сплошной
+        # текст без меток: для записей на объекте, голосовых, лекций так удобнее
         text = transcript.text or ""
 
-    return text, language, n_speakers
+    return text, language, n_speakers, rows
 
 
 # ============================== CLAUDE: КЛАССИФИКАЦИЯ ПО РАЗДЕЛУ/ТЕМЕ ==============================
@@ -511,8 +562,59 @@ def _find_heading_id_sync(service, doc_id: str, heading_text: str):
         return None
 
 
+def _build_table_requests(rows: list[dict], tab_id: str | None, start_index: int) -> list[dict]:
+    """Формирует запросы для вставки таблицы таймингов.
+
+    Google Docs API не даёт вставить таблицу сразу с содержимым: сначала
+    создаётся пустая таблица, потом текст вставляется в ячейки. Индексы ячеек
+    приходится пересчитывать, поэтому заполнение идёт ОТ КОНЦА к началу —
+    так вставка текста не сдвигает индексы ещё не заполненных ячеек."""
+    header = ["Время", "Длит.", "Спикер", "Текст"]
+    table_rows = [header] + [
+        [
+            f"{format_timestamp(r['start'])}–{format_timestamp(r['end'])}",
+            format_duration(r["duration"]),
+            r["speaker"],
+            r["text"],
+        ]
+        for r in rows
+    ]
+
+    location = {"index": start_index}
+    if tab_id:
+        location["tabId"] = tab_id
+
+    requests = [{
+        "insertTable": {
+            "location": location,
+            "rows": len(table_rows),
+            "columns": len(header),
+        }
+    }]
+
+    # Пустая таблица занимает предсказуемое число индексов:
+    # сама таблица +1, каждая строка +1, каждая ячейка +2 (параграф внутри)
+    cell_positions = []
+    idx = start_index + 1  # +1: начало таблицы
+    for row_values in table_rows:
+        idx += 1  # начало строки
+        for value in row_values:
+            cell_positions.append((idx + 1, value))
+            idx += 2  # пустая ячейка = 2 индекса
+    # Заполняем от конца к началу, чтобы индексы не съезжали
+    for cell_index, value in reversed(cell_positions):
+        if not value:
+            continue
+        cell_location = {"index": cell_index}
+        if tab_id:
+            cell_location["tabId"] = tab_id
+        requests.append({"insertText": {"location": cell_location, "text": value}})
+
+    return requests
+
+
 def _add_entry_to_master_doc_sync(
-    title: str, source_type: str, roles_mode: bool, text: str, topic: str = ""
+    title: str, source_type: str, text: str, topic: str = "", rows: list[dict] | None = None
 ) -> str:
     service = _get_docs_service()
     doc_id = _get_master_doc_id_sync(service)
@@ -526,23 +628,55 @@ def _add_entry_to_master_doc_sync(
     else:
         display_name = base_name
 
-    heading_text = (
-        f"{now_msk().strftime('%d.%m.%Y %H:%M')} — {display_name} "
-        f"({'по ролям' if roles_mode else 'обычная'})"
-    )
+    heading_text = f"{now_msk().strftime('%d.%m.%Y %H:%M')} — {display_name}"
     # Дата+время в названии вкладки — чтобы не совпадало с более старой вкладкой
     # с таким же названием (иначе поиск по названию может найти не ту вкладку)
     tab_title = f"{display_name[:60]} · {now_msk().strftime('%d.%m %H:%M')}"[:80]
 
     tab_id = _try_create_tab_sync(service, doc_id, tab_title)
     if tab_id:
-        requests = [{
-            "insertText": {
-                "location": {"tabId": tab_id, "index": 1},
-                "text": f"{heading_text}\n{text}",
-            }
-        }]
-        service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
+        # Сначала заголовок, потом таблица (или текст, если таблицы нет)
+        service.documents().batchUpdate(
+            documentId=doc_id,
+            body={"requests": [{
+                "insertText": {
+                    "location": {"tabId": tab_id, "index": 1},
+                    "text": f"{heading_text}\n",
+                }
+            }]},
+        ).execute()
+
+        body_index = 1 + len(heading_text) + 1
+        if rows:
+            try:
+                table_requests = _build_table_requests(rows, tab_id, body_index)
+                service.documents().batchUpdate(
+                    documentId=doc_id, body={"requests": table_requests}
+                ).execute()
+            except Exception as e:
+                # Таблица не собралась (много строк, лимиты API, сдвиг индексов) —
+                # не теряем запись: кладём тот же контент текстом с таймингами
+                logger.warning(f"Не удалось построить таблицу таймингов, пишу текстом: {e}")
+                service.documents().batchUpdate(
+                    documentId=doc_id,
+                    body={"requests": [{
+                        "insertText": {
+                            "location": {"tabId": tab_id, "index": body_index},
+                            "text": text,
+                        }
+                    }]},
+                ).execute()
+        else:
+            service.documents().batchUpdate(
+                documentId=doc_id,
+                body={"requests": [{
+                    "insertText": {
+                        "location": {"tabId": tab_id, "index": body_index},
+                        "text": text,
+                    }
+                }]},
+            ).execute()
+
         return f"https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id}"
 
     # Запасной путь — заголовок в общем документе
@@ -570,14 +704,16 @@ def _add_entry_to_master_doc_sync(
 
 
 async def add_entry_to_master_doc(
-    title: str, source_type: str, roles_mode: bool, text: str, topic: str = ""
+    title: str, source_type: str, text: str, topic: str = "", rows: list[dict] | None = None
 ):
     if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REFRESH_TOKEN):
         return None
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_add_entry_to_master_doc_sync, title, source_type, roles_mode, text, topic),
-            timeout=120,
+            asyncio.to_thread(
+                _add_entry_to_master_doc_sync, title, source_type, text, topic, rows
+            ),
+            timeout=300,  # таблица на сотни строк собирается дольше обычного текста
         )
     except Exception as e:
         logger.error(f"Ошибка создания записи в Google Docs: {e}")
@@ -627,26 +763,25 @@ async def finalize_result(
     language: str | None,
     n_speakers: int,
     duration_seconds: float,
-    roles_mode: bool,
     source_type: str,
     link: str,
     title: str,
-    destination: str,
+    rows: list[dict] | None = None,
 ):
     word_count = len(text.split()) if text else 0
     duration_min = round(duration_seconds / 60, 1) if duration_seconds else 0
-    rate_per_hour = PRICE_PER_HOUR_BASE + (
-        PRICE_PER_HOUR_DIARIZATION_ADDON if roles_mode else 0
-    )
+    # Диаризация включена всегда, поэтому в цену входит и она
+    rate_per_hour = PRICE_PER_HOUR_BASE + PRICE_PER_HOUR_DIARIZATION_ADDON
     cost = round((duration_seconds / 3600) * rate_per_hour, 4) if duration_seconds else 0.0
+
+    # Таблица таймингов имеет смысл только когда собеседников несколько
+    use_table = n_speakers > 1 and bool(rows)
+    mode_label = "по ролям" if n_speakers > 1 else "монолог"
 
     summary = (
         f"✅ Готово: {duration_min} мин, {word_count} слов, "
-        f"язык: {language or 'не определён'}"
+        f"язык: {language or 'не определён'}, спикеров: {n_speakers}"
     )
-    if roles_mode:
-        summary += f", спикеров: {n_speakers}"
-
     try:
         await status_msg.edit_text(summary)
     except TelegramBadRequest as e:
@@ -660,40 +795,39 @@ async def finalize_result(
     else:
         classification = await classify_transcript(text)
         topic = classification.get("topic", "")
-        parts = split_text(text)
 
-        # В чат — сообщением или файлом, по тому, помещается ли в одно сообщение Telegram
-        if len(parts) == 1:
-            await message.answer(parts[0], parse_mode=None)
-        else:
-            filename = make_txt_filename(title, source_type)
-            tmp_txt_dir = tempfile.mkdtemp(prefix="trb_txt_")
-            try:
-                file_path = os.path.join(tmp_txt_dir, filename)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(text)
-                await message.answer_document(FSInputFile(file_path, filename=filename))
-            except Exception as e:
-                logger.error(f"Ошибка отправки txt-файла: {e}")
-                # запасной путь — всё же отправить частями, чтобы текст не потерялся
-                for chunk in parts:
-                    await message.answer(chunk, parse_mode=None)
-            finally:
-                shutil.rmtree(tmp_txt_dir, ignore_errors=True)
+        # 1. Всегда .txt файлом в чат — удобно переслать, сохранить, открыть
+        filename = make_txt_filename(title, source_type)
+        tmp_txt_dir = tempfile.mkdtemp(prefix="trb_txt_")
+        try:
+            file_path = os.path.join(tmp_txt_dir, filename)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            await message.answer_document(FSInputFile(file_path, filename=filename))
+        except Exception as e:
+            logger.error(f"Ошибка отправки txt-файла: {e}")
+            # запасной путь — отправить частями, чтобы текст не потерялся
+            for chunk in split_text(text):
+                await message.answer(chunk, parse_mode=None)
+        finally:
+            shutil.rmtree(tmp_txt_dir, ignore_errors=True)
 
-        # Куда сохраняем: по выбору пользователя (Docs/Sheet), но если выбран Sheet
-        # и текст не влезает в ячейку — всё равно уходит в Docs, чтобы не обрезать
-        needs_docs = destination == "docs" or len(text) > SHEET_CELL_LIMIT
-        if needs_docs:
-            doc_link = await add_entry_to_master_doc(title, source_type, roles_mode, text, topic)
-            if doc_link:
-                await message.answer(f"📄 Сохранено в Google Docs: {doc_link}", parse_mode=None)
-                sheet_text = doc_link
-            else:
-                # Google Docs не настроен или не сработал — подстраховка от лимита ячейки Sheets
-                sheet_text = text[:SHEET_CELL_LIMIT] + "\n\n[...обрезано, лимит ячейки Google Sheets — Docs не создался]"
-        else:
+        # 2. Всегда отдельная вкладка в Google Docs (с таблицей, если есть роли)
+        doc_link = await add_entry_to_master_doc(
+            title, source_type, text, topic, rows if use_table else None
+        )
+
+        # 3. В ячейку таблицы: короткие записи целиком, длинные — ссылкой на Docs
+        is_short = duration_seconds and duration_seconds <= SHEET_TEXT_MAX_DURATION_SEC
+        if is_short and len(text) <= SHEET_CELL_LIMIT:
             sheet_text = text
+        elif doc_link:
+            sheet_text = doc_link
+        else:
+            # Docs не создался — кладём текст, обрезав под лимит ячейки
+            sheet_text = text[:SHEET_CELL_LIMIT]
+            if len(text) > SHEET_CELL_LIMIT:
+                sheet_text += "\n\n[...обрезано, лимит ячейки — Docs не создался, полный текст в файле выше]"
 
     row = [
         now_msk().strftime("%Y-%m-%d %H:%M"),
@@ -702,17 +836,18 @@ async def finalize_result(
         title or "",
         classification.get("category", ""),
         classification.get("topic", ""),
-        "по ролям" if roles_mode else "обычная",
+        mode_label,
         language or "не определён",
-        n_speakers if roles_mode else "",
+        n_speakers,
         duration_min,
         word_count,
         cost,
         sheet_text,
         "готово",
     ]
+    sheet_link = None
     try:
-        await append_transcript_row(row)
+        sheet_link = await append_transcript_row(row)
     except Exception as e:
         logger.error(f"Ошибка записи в Sheets: {e}")
         await notify_admin(f"Транскрибатор: не удалось записать в Google Sheets: {e}")
@@ -720,23 +855,26 @@ async def finalize_result(
             "⚠️ Текст готов, но не получилось сохранить в таблицу — админ уведомлён."
         )
 
-    current_mode = get_user_mode(message.from_user.id)
-    current_destination = get_user_destination(message.from_user.id)
-    await message.answer(
-        "Выберите режим и место сохранения для следующей записи:",
-        reply_markup=settings_keyboard(current_mode, current_destination),
-    )
+    # 4. Две ссылки одним сообщением: на запись в Docs и на строку в таблице
+    links = []
+    if text:
+        if doc_link:
+            links.append(f"📄 Google Docs: {doc_link}")
+        else:
+            links.append("📄 Google Docs: не удалось создать запись")
+    if sheet_link:
+        links.append(f"📊 Google Sheets: {sheet_link}")
+    if links:
+        await message.answer("\n\n".join(links), parse_mode=None)
 
 
-async def save_error_row(source_type: str, link: str, title: str, roles_mode: bool, error_text: str):
+async def save_error_row(source_type: str, link: str, title: str, error_text: str):
     row = [
         now_msk().strftime("%Y-%m-%d %H:%M"),
         source_type,
         link or "",
         title or "",
-        "", "",
-        "по ролям" if roles_mode else "обычная",
-        "", "", "", "", "",
+        "", "", "", "", "", "", "", "",
         f"ОШИБКА: {error_text[:500]}",
         "ошибка",
     ]
@@ -751,9 +889,6 @@ async def save_error_row(source_type: str, link: str, title: str, roles_mode: bo
 
 async def process_voice(message: Message):
     user_id = message.from_user.id
-    mode = get_user_mode(user_id)
-    roles_mode = mode == "roles"
-    destination = get_user_destination(user_id)
     voice = message.voice
 
     if voice.file_size and voice.file_size > MAX_VOICE_FILE_MB * 1024 * 1024:
@@ -770,11 +905,10 @@ async def process_voice(message: Message):
         await bot.download(voice, destination=local_path)
         duration = voice.duration or 0
 
-        text, language, n_speakers = await transcribe_audio(local_path, roles_mode)
+        text, language, n_speakers, rows = await transcribe_audio(local_path)
         await finalize_result(
             message, status_msg, text, language, n_speakers, duration,
-            roles_mode, source_type="голосовое", link="", title=title,
-            destination=destination,
+            source_type="голосовое", link="", title=title, rows=rows,
         )
     except Exception as e:
         logger.exception("Ошибка обработки голосового")
@@ -783,7 +917,7 @@ async def process_voice(message: Message):
             await status_msg.edit_text("❌ Не получилось распознать. Админ уже уведомлён.")
         except TelegramBadRequest:
             pass
-        await save_error_row("голосовое", "", title, roles_mode, str(e))
+        await save_error_row("голосовое", "", title, str(e))
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -807,9 +941,6 @@ async def handle_voice(message: Message):
 
 async def process_link(message: Message, url: str):
     user_id = message.from_user.id
-    mode = get_user_mode(user_id)
-    roles_mode = mode == "roles"
-    destination = get_user_destination(user_id)
     source_type = detect_source(url)
 
     status_msg = await message.answer(f"⏳ Скачиваю аудио с {source_type}...")
@@ -819,16 +950,21 @@ async def process_link(message: Message, url: str):
         local_path, duration, title = await asyncio.to_thread(
             download_audio_via_ytdlp_guarded, url, tmp_dir
         )
+        # На длинных записях показываем ожидаемое время, чтобы не казалось, что бот завис
+        if duration:
+            eta_min = max(int(duration / 60 / 3), 1)
+            status_text = f"⏳ Распознаю текст... (примерно {eta_min} мин)"
+        else:
+            status_text = "⏳ Распознаю текст..."
         try:
-            await status_msg.edit_text("⏳ Распознаю текст...")
+            await status_msg.edit_text(status_text)
         except TelegramBadRequest:
             pass
 
-        text, language, n_speakers = await transcribe_audio(local_path, roles_mode)
+        text, language, n_speakers, rows = await transcribe_audio(local_path)
         await finalize_result(
             message, status_msg, text, language, n_speakers, duration,
-            roles_mode, source_type, link=url, title=title,
-            destination=destination,
+            source_type, link=url, title=title, rows=rows,
         )
     except ValueError as e:
         # предсказуемая ошибка (например, слишком длинный ролик) — без нотификации админу
@@ -836,7 +972,7 @@ async def process_link(message: Message, url: str):
             await status_msg.edit_text(f"⚠️ {e}", parse_mode=None)
         except TelegramBadRequest:
             pass
-        await save_error_row(source_type, url, title, roles_mode, str(e))
+        await save_error_row(source_type, url, title, str(e))
     except Exception as e:
         logger.exception("Ошибка обработки ссылки")
         await notify_admin(f"Транскрибатор: ошибка (ссылка {url}), user={user_id}: {e}")
@@ -844,7 +980,7 @@ async def process_link(message: Message, url: str):
             await status_msg.edit_text(f"❌ Не получилось скачать или распознать: {str(e)[:300]}", parse_mode=None)
         except TelegramBadRequest:
             pass
-        await save_error_row(source_type, url, title, roles_mode, str(e))
+        await save_error_row(source_type, url, title, str(e))
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -859,9 +995,7 @@ async def cmd_start(message: Message):
         await message.answer("Доступ закрыт.")
         logger.warning(f"Попытка доступа: user_id={user_id} username={message.from_user.username}")
         return
-    mode = get_user_mode(user_id)
-    destination = get_user_destination(user_id)
-    await message.answer(WELCOME_TEXT, reply_markup=settings_keyboard(mode, destination))
+    await message.answer(WELCOME_TEXT)
 
 
 @dp.message(Command("version"))
@@ -869,38 +1003,6 @@ async def cmd_version(message: Message):
     if not is_allowed(message.from_user.id):
         return
     await message.answer(f"Версия: {BOT_VERSION}")
-
-
-@dp.callback_query(F.data.in_({"mode_normal", "mode_roles"}))
-async def cb_mode(cb: CallbackQuery):
-    if not is_allowed(cb.from_user.id):
-        await cb.answer("Доступ закрыт", show_alert=True)
-        return
-    mode = "normal" if cb.data == "mode_normal" else "roles"
-    set_user_mode(cb.from_user.id, mode)
-    destination = get_user_destination(cb.from_user.id)
-    try:
-        await cb.message.edit_text(WELCOME_TEXT, reply_markup=settings_keyboard(mode, destination))
-    except TelegramBadRequest as e:
-        if "not modified" not in str(e).lower():
-            logger.warning(f"cb_mode edit_text error: {e}")
-    await cb.answer(f"Режим: {'обычная' if mode == 'normal' else 'по ролям'}")
-
-
-@dp.callback_query(F.data.in_({"dest_docs", "dest_sheet"}))
-async def cb_destination(cb: CallbackQuery):
-    if not is_allowed(cb.from_user.id):
-        await cb.answer("Доступ закрыт", show_alert=True)
-        return
-    destination = "docs" if cb.data == "dest_docs" else "sheet"
-    set_user_destination(cb.from_user.id, destination)
-    mode = get_user_mode(cb.from_user.id)
-    try:
-        await cb.message.edit_text(WELCOME_TEXT, reply_markup=settings_keyboard(mode, destination))
-    except TelegramBadRequest as e:
-        if "not modified" not in str(e).lower():
-            logger.warning(f"cb_destination edit_text error: {e}")
-    await cb.answer(f"Сохранение: {'Google Docs' if destination == 'docs' else 'Google Sheet'}")
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
